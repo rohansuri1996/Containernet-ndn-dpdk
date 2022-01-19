@@ -11,12 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"strconv"
-	"sync"
+	"path/filepath"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
-	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
 	"github.com/usnistgov/ndn-dpdk/core/cptr"
 	"github.com/usnistgov/ndn-dpdk/core/logging"
@@ -24,7 +23,6 @@ import (
 	"github.com/usnistgov/ndn-dpdk/dpdk/ealthread"
 	"github.com/usnistgov/ndn-dpdk/dpdk/pktmbuf"
 	"github.com/usnistgov/ndn-dpdk/dpdk/ringbuffer"
-	"github.com/usnistgov/ndn-dpdk/iface"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
 )
@@ -43,6 +41,7 @@ type WriterConfig struct {
 }
 
 func (cfg *WriterConfig) applyDefaults() {
+	cfg.Filename = filepath.Clean(cfg.Filename)
 	if cfg.MaxSize == 0 {
 		cfg.MaxSize = DefaultFileSize
 	}
@@ -63,16 +62,17 @@ func (cfg WriterConfig) validate() error {
 	return multierr.Combine(errs...)
 }
 
-// Writer is a pdump writer thread.
+// Writer is a packet dump writer thread.
 type Writer struct {
 	ealthread.ThreadWithCtrl
-	c     *C.PdumpWriter
-	queue *ringbuffer.Ring
-	mp    *pktmbuf.Pool
+	filename string
+	c        *C.PdumpWriter
+	queue    *ringbuffer.Ring
+	mp       *pktmbuf.Pool
 
-	wg     sync.WaitGroup
-	faces  map[iface.ID]string // faceID => Locator
-	hasSHB bool
+	nSources int32
+	intfs    map[int]pcapgo.NgInterface
+	hasSHB   bool
 }
 
 var (
@@ -80,23 +80,34 @@ var (
 	_ ealthread.ThreadWithLoadStat = (*Writer)(nil)
 )
 
-func (w *Writer) startDumper() {
-	w.wg.Add(1)
+// startSource records a source starting.
+// The writer cannot be closed until all sources have stopped.
+func (w *Writer) startSource() {
+	n := atomic.AddInt32(&w.nSources, 1)
+	if n <= 0 {
+		panic("attempting to startSource on stopped Writer")
+	}
 }
 
-func (w *Writer) stopDumper() {
-	w.wg.Done()
+// stopSource records a source stopping.
+// The writer can be closed after all sources have stopped.
+func (w *Writer) stopSource() {
+	n := atomic.AddInt32(&w.nSources, -1)
+	if n < 0 {
+		panic("w.nSources is negative")
+	}
 }
 
-// AddFace records a face as NgInterface.
-func (w *Writer) AddFace(face iface.Face) {
-	id, loc := face.ID(), iface.LocatorString(face.Locator())
-	if w.faces[id] == loc {
+// defineIntf defines an NgInterface.
+// intf.Name, intf.Description, and intf.LinkType should be set; other fields are ignored.
+// Caller should hold sourcesLock.
+func (w *Writer) defineIntf(id int, intf pcapgo.NgInterface) {
+	if w.intfs[id] == intf {
 		return
 	}
-	w.faces[id] = loc
+	w.intfs[id] = intf
 
-	shb, idb := ngMakeHeader(id, loc)
+	shb, idb := ngMakeHeader(id, intf)
 	if !w.hasSHB {
 		w.putBlock(shb, NgTypeSHB, math.MaxUint16)
 		w.hasSHB = true
@@ -122,7 +133,7 @@ func (w *Writer) putBlock(block []byte, blockType uint32, port uint16) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	logger.Info("sent pcapng block", zap.Uint32("type", blockType))
+	logger.Debug("sent pcapng block", zap.Uint32("type", blockType))
 }
 
 // ThreadRole implements ealthread.ThreadWithRole interface.
@@ -132,10 +143,15 @@ func (Writer) ThreadRole() string {
 
 // Close releases resources.
 func (w *Writer) Close() error {
+	if !atomic.CompareAndSwapInt32(&w.nSources, 0, -65536) {
+		return errors.New("cannot stop Writer with active sources")
+	}
+
 	e := w.Stop()
-	logger.Info("PdumpWriter stopped", zap.Uintptr("queue", uintptr(unsafe.Pointer(w.c.queue))))
-	w.wg.Wait()
-	logger.Info("PdumpWriter close", zap.Uintptr("queue", uintptr(unsafe.Pointer(w.c.queue))))
+	logger.Info("Writer stopped",
+		zap.Uintptr("queue", uintptr(unsafe.Pointer(w.c.queue))),
+		zap.Error(e),
+	)
 
 	if w.c != nil {
 		C.free(unsafe.Pointer(w.c.filename))
@@ -156,7 +172,7 @@ func (w *Writer) Close() error {
 		w.queue = nil
 	}
 
-	return e
+	return nil
 }
 
 // NewWriter creates a pdump writer thread.
@@ -167,9 +183,10 @@ func NewWriter(cfg WriterConfig) (w *Writer, e error) {
 	}
 
 	w = &Writer{
-		c:     (*C.PdumpWriter)(eal.Zmalloc("PdumpWriter", C.sizeof_PdumpWriter, cfg.Socket)),
-		mp:    pktmbuf.Direct.Get(cfg.Socket),
-		faces: map[iface.ID]string{},
+		filename: cfg.Filename,
+		c:        (*C.PdumpWriter)(eal.Zmalloc("PdumpWriter", C.sizeof_PdumpWriter, cfg.Socket)),
+		mp:       pktmbuf.Direct.Get(cfg.Socket),
+		intfs:    map[int]pcapgo.NgInterface{},
 	}
 	w.c.filename = C.CString(cfg.Filename)
 	w.c.maxSize = C.size_t(cfg.MaxSize)
@@ -193,15 +210,18 @@ func NewWriter(cfg WriterConfig) (w *Writer, e error) {
 	}
 	w.c.queue = (*C.struct_rte_ring)(w.queue.Ptr())
 
-	logger.Info("PdumpWriter open", zap.Uintptr("queue", uintptr(unsafe.Pointer(w.c.queue))))
+	logger.Info("Writer open",
+		zap.String("filename", cfg.Filename),
+		zap.Uintptr("queue", uintptr(unsafe.Pointer(w.c.queue))),
+	)
 	return w, nil
 }
 
-func ngMakeHeader(id iface.ID, loc string) (shb, idb []byte) {
+func ngMakeHeader(id int, info pcapgo.NgInterface) (shb, idb []byte) {
 	intf := pcapgo.DefaultNgInterface
-	intf.Name = strconv.Itoa(int(id))
-	intf.Description = loc
-	intf.LinkType = layers.LinkTypeLinuxSLL
+	intf.Name = info.Name
+	intf.Description = info.Description
+	intf.LinkType = info.LinkType
 	intf.SnapLength = 262144
 
 	wOpt := pcapgo.DefaultNgWriterOptions

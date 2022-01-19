@@ -65,14 +65,15 @@ func ctestInterestParse(t *testing.T) {
 
 	// full
 	p = makePacket(`
-		055C
+		0557
 		072508`, `0141 01207F6A877C0CCD0AA5A7638F9749E9293CF81C32793670B481D5A6DB788C0831CE // name
 		2100 // canbeprefix
 		FD03BC00 // unknown-ignored
 		1200 // mustbefresh
-		1E1B // fwhint
-			1F091E0121070408`, `024648
-			1F0E (unknown FD03BC00) 1E012207050803484632
+		1E16 // fwhint
+			070408`, `024648
+			(unknown FD03BC00) 07050803484632
+			0703080800 // invalid name
 		0A04A0A1A2A3 // nonce
 		0C0276A1 // lifetime
 		2201DC // hoplimit
@@ -86,7 +87,7 @@ func ctestInterestParse(t *testing.T) {
 	assert.EqualValues(37, interest.name.length)
 	assert.EqualValues(true, u.canBePrefix)
 	assert.EqualValues(true, u.mustBeFresh)
-	assert.EqualValues(2, u.nFwHints)
+	assert.EqualValues(3, u.nFwHints)
 	assert.EqualValues(-1, u.activeFwHint)
 	assert.EqualValues(0xA0A1A2A3, interest.nonce)
 	assert.EqualValues(30369, interest.lifetime)
@@ -104,6 +105,8 @@ func ctestInterestParse(t *testing.T) {
 	assert.EqualValues(1, u.activeFwHint)
 	assert.EqualValues(1, interest.fwHint.nComps)
 	assert.Equal(bytesFromHex("0803484632"), C.GoBytes(unsafe.Pointer(interest.fwHint.value), C.int(interest.fwHint.length)))
+
+	assert.False(bool(C.PInterest_SelectFwHint(interest, 2)))
 }
 
 func checkInterestModify(t *testing.T, fragmentPayloadSize C.uint16_t, nSegs int, input string, check func(interest *C.PInterest, u C.PInterestUnpacked)) {
@@ -152,7 +155,7 @@ func checkInterestModify(t *testing.T, fragmentPayloadSize C.uint16_t, nSegs int
 func ctestInterestModify(t *testing.T) {
 	assert, _ := makeAR(t)
 
-	const inputShort = "050B 0703080141 0A04A0A1A2A3"
+	inputShort := "050B 0703080141 0A04A0A1A2A3"
 	checkShort := func(interest *C.PInterest, u C.PInterestUnpacked) {
 		assert.EqualValues(1, interest.name.nComps)
 		assert.Equal(bytesFromHex("080141"), C.GoBytes(unsafe.Pointer(interest.name.value), C.int(interest.name.length)))

@@ -12,9 +12,6 @@ typedef struct NonceGen
   pcg32_random_t rng;
 } NonceGen;
 
-__attribute__((nonnull)) void
-NonceGen_Init(NonceGen* g);
-
 __attribute__((nonnull)) static __rte_always_inline uint32_t
 NonceGen_Next(NonceGen* g)
 {
@@ -77,7 +74,7 @@ typedef struct InterestGuiders
 /**
  * @brief printf format string for InterestGuiders.
  * @code
- * printf("mbuf=%p " PRI_InterestGuiders " suffix", mbuf, InterestGuiders_Fmt(guiders))
+ * printf("mbuf=%p " PRI_InterestGuiders " suffix", mbuf, InterestGuiders_Fmt(guiders));
  * @endcode
  */
 #define PRI_InterestGuiders "nonce=%08" PRIx32 " lifetime=%" PRIu32 " hopLimit=%" PRIu8

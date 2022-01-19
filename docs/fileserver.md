@@ -29,9 +29,7 @@ There are four steps to start a file server and connect it to the forwarder:
 NDN-DPDK provides TypeScript definitions to help with authoring the parameters.
 You may install the NPM package from `/usr/local/share/ndn-dpdk/ndn-dpdk.npm.tgz` (built from [js](../js) directory), and then construct an object of `ActivateFileServerArgs` type.
 
-[docs/activate](activate) is a sample TypeScript project that generates the parameters.
-You can follow a similar procedure as [forwarder activation and usage](forwarder.md) to use this sample.
-`fileserver-args.ts` contains activation parameters.
+[NDN-DPDK activation sample](../sample/activate) is a sample TypeScript project that generates the parameters.
 
 ### Commonly Used Activation Parameters
 
@@ -65,12 +63,13 @@ See [performance tuning](tuning.md) "LCore Allocation" section on how to run wit
 
 ### Alternate Setup Methods
 
-Instead of connecting to the local NDN-DPDK forwarder, it is possible to run a standalone file server that listens on a physical Ethernet adapter.
-You may do so by setting `.face` locator to an Ethernet adapter, and including the PCI address of the Ethernet adapter in `.eal.pciDevices`.
-
 The file server is internally implemented as a traffic generator component.
 Therefore, it is possible to start a file server as part of the traffic generator.
 You may do so by invoking GraphQL `startTrafficGen` mutation with a JSON document that contains `.fileServer` field.
+
+Instead of connecting to the local NDN-DPDK forwarder, it is possible to run a standalone file server that listens on a physical Ethernet adapter.
+You may do so by setting `.face` locator to an Ethernet-based face instead of a memif face.
+See [traffic generator](trafficgen.md) for requirements of Ethernet port creation.
 
 ## Sample Scenario: transfer NDN-DPDK itself
 
@@ -119,7 +118,7 @@ If you are running [NDN-DPDK in Docker container](Docker.md), start another cont
 The `/run/ndn` directory should be mounted into both containers in order to establish memif connection.
 In this case, you should change `--gqlserver` flag to target the container.
 
-The sample activation parameters given in [docs/activate](activate) may be used in this scenario.
+The sample activation parameters given in [NDN-DPDK activation sample](../sample/activate) may be used in this scenario.
 
 1. Make a copy of this directory to somewhere outside the NDN-DPDK repository.
 2. Run `npm install` to install dependencies.

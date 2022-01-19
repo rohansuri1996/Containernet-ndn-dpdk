@@ -3,88 +3,126 @@ package pdump
 import (
 	"fmt"
 	"reflect"
+	"strconv"
 	"sync"
-	"time"
+	"unsafe"
 
 	"github.com/graphql-go/graphql"
 	"github.com/usnistgov/ndn-dpdk/core/gqlserver"
 	"github.com/usnistgov/ndn-dpdk/core/jsonhelper"
-	"github.com/usnistgov/ndn-dpdk/core/nnduration"
 	"github.com/usnistgov/ndn-dpdk/dpdk/eal"
 	"github.com/usnistgov/ndn-dpdk/dpdk/ealthread"
+	"github.com/usnistgov/ndn-dpdk/dpdk/ethdev"
 	"github.com/usnistgov/ndn-dpdk/iface"
+	"github.com/usnistgov/ndn-dpdk/iface/ethport"
 	"github.com/usnistgov/ndn-dpdk/ndn"
 	"github.com/usnistgov/ndn-dpdk/ndni"
 )
 
 var (
 	// GqlLCore is the LCore used for writer created via GraphQL.
-	GqlLCore eal.LCore
-
-	gqlMutex sync.Mutex
-
-	errNoLCore = fmt.Errorf("no LCore for %s role", Role)
+	GqlLCore  eal.LCore
+	gqlWriter *Writer
+	gqlMutex  sync.Mutex
 )
 
 // GraphQL types.
 var (
-	GqlDirectionEnum        *graphql.Enum
-	GqlNameFilterEntryInput *graphql.InputObject
-	GqlFaceConfigInput      *graphql.InputObject
+	GqlDirectionEnum         *graphql.Enum
+	GqlEthGrabEnum           *graphql.Enum
+	GqlNameFilterEntryInput  *graphql.InputObject
+	GqlNameFilterEntryType   *graphql.Object
+	GqlWriterNodeType        *gqlserver.NodeType
+	GqlWriterType            *graphql.Object
+	GqlFaceSourceNodeType    *gqlserver.NodeType
+	GqlFaceSourceType        *graphql.Object
+	GqlEthPortSourceNodeType *gqlserver.NodeType
+	GqlEthPortSourceType     *graphql.Object
+	GqlSourceType            *graphql.Union
 )
 
 func init() {
-	GqlDirectionEnum = graphql.NewEnum(graphql.EnumConfig{
-		Name:        "PdumpDirection",
-		Description: "Packet dumper traffic direction.",
-		Values: graphql.EnumValueConfigMap{
-			string(DirIncoming): &graphql.EnumValueConfig{Value: DirIncoming},
-			string(DirOutgoing): &graphql.EnumValueConfig{Value: DirOutgoing},
-		},
-	})
+	GqlDirectionEnum = gqlserver.NewStringEnum("PdumpDirection", "Packet dump traffic direction.", DirIncoming, DirOutgoing)
+	GqlEthGrabEnum = gqlserver.NewStringEnum("PdumpEthGrab", "Packet dump Ethernet port grab position.", EthGrabRxUnmatched)
 	GqlNameFilterEntryInput = graphql.NewInputObject(graphql.InputObjectConfig{
 		Name:        "PdumpNameFilterEntryInput",
-		Description: "Packet dumper name filter entry.",
+		Description: "Packet dump name filter entry.",
 		Fields: gqlserver.BindInputFields(NameFilterEntry{}, gqlserver.FieldTypes{
 			reflect.TypeOf(ndn.Name{}): ndni.GqlNameType,
 		}),
 	})
-	GqlFaceConfigInput = graphql.NewInputObject(graphql.InputObjectConfig{
-		Name:        "PdumpFaceConfigInput",
-		Description: "Face packet dumper configuration.",
-		Fields: gqlserver.BindInputFields(FaceConfig{}, gqlserver.FieldTypes{
-			reflect.TypeOf(Direction("")):     GqlDirectionEnum,
-			reflect.TypeOf(NameFilterEntry{}): GqlNameFilterEntryInput,
+	GqlNameFilterEntryType = graphql.NewObject(graphql.ObjectConfig{
+		Name:        "PdumpNameFilterEntry",
+		Description: "Packet dump name filter entry.",
+		Fields: gqlserver.BindFields(NameFilterEntry{}, gqlserver.FieldTypes{
+			reflect.TypeOf(ndn.Name{}): ndni.GqlNameType,
 		}),
 	})
 
+	GqlWriterNodeType = gqlserver.NewNodeType((*Writer)(nil))
+	GqlWriterNodeType.GetID = func(source interface{}) string {
+		w := source.(*Writer)
+		return strconv.FormatUint(uint64(uintptr(unsafe.Pointer(w.c))), 16)
+	}
+	GqlWriterNodeType.Retrieve = func(id string) (interface{}, error) {
+		gqlMutex.Lock()
+		defer gqlMutex.Unlock()
+		if gqlWriter != nil && GqlWriterNodeType.GetID(gqlWriter) == id {
+			return gqlWriter, nil
+		}
+		return nil, nil
+	}
+	GqlWriterNodeType.Delete = func(source interface{}) error {
+		w := source.(*Writer)
+		if e := w.Close(); e != nil {
+			return e
+		}
+
+		gqlMutex.Lock()
+		defer gqlMutex.Unlock()
+		gqlWriter = nil
+		return nil
+	}
+
+	GqlWriterType = graphql.NewObject(GqlWriterNodeType.Annotate(graphql.ObjectConfig{
+		Name:        "PdumpWriter",
+		Description: "Packet dump writer.",
+		Fields: graphql.Fields{
+			"filename": &graphql.Field{
+				Description: "Destination filename.",
+				Type:        gqlserver.NonNullString,
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					gqlMutex.Lock()
+					defer gqlMutex.Unlock()
+
+					w := p.Source.(*Writer)
+					return w.filename, nil
+				},
+			},
+			"worker": ealthread.GqlWithWorker(nil),
+		},
+	}))
+	GqlWriterNodeType.Register(GqlWriterType)
+
 	gqlserver.AddMutation(&graphql.Field{
-		Name:        "pdump",
-		Description: "Dump packets from faces.",
+		Name:        "createPdumpWriter",
+		Description: "Start packet dump writer.",
 		Args: graphql.FieldConfigArgument{
 			"filename": &graphql.ArgumentConfig{
 				Description: "Output file name.",
 				Type:        gqlserver.NonNullString,
 			},
 			"maxSize": &graphql.ArgumentConfig{
-				Description: "Maximum output file size in bytes.",
+				Description: "Maximum output file size in bytes. Storage will be pre-allocated.",
 				Type:        graphql.Int,
 			},
-			"duration": &graphql.ArgumentConfig{
-				Description: "Collection duration.",
-				Type:        graphql.NewNonNull(nnduration.GqlNanoseconds),
-			},
-			"faces": &graphql.ArgumentConfig{
-				Description: "Faces to collect from.",
-				Type:        gqlserver.NewNonNullList(GqlFaceConfigInput),
-			},
 		},
-		Type: gqlserver.NonNullBoolean,
+		Type: graphql.NewNonNull(GqlWriterType),
 		Resolve: func(p graphql.ResolveParams) (interface{}, error) {
 			gqlMutex.Lock()
 			defer gqlMutex.Unlock()
 			if !GqlLCore.Valid() || GqlLCore.IsBusy() {
-				return nil, errNoLCore
+				return nil, fmt.Errorf("no LCore for %s role; check activation parameters and ensure there's no other writer running", Role)
 			}
 
 			cfg := WriterConfig{
@@ -99,31 +137,232 @@ func init() {
 			}
 			w.SetLCore(GqlLCore)
 			ealthread.Launch(w)
+			gqlWriter = w
+			return w, nil
+		},
+	})
 
-			faceDumps := []*Face{}
-			defer func() {
-				for _, pd := range faceDumps {
-					pd.Close()
-				}
-				w.Close()
-			}()
+	gqlserver.AddQuery(&graphql.Field{
+		Name:        "pdumpWriters",
+		Description: "List of active packet dump writers.",
+		Type:        gqlserver.NewNonNullList(GqlWriterType),
+		Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			gqlMutex.Lock()
+			defer gqlMutex.Unlock()
 
-			var faceConfigs []FaceConfig
-			jsonhelper.Roundtrip(p.Args["faces"], &faceConfigs)
-			for i, f := range faceConfigs {
-				var face iface.Face
-				if e := gqlserver.RetrieveNodeOfType(iface.GqlFaceNodeType, f.ID, &face); e != nil {
-					return nil, fmt.Errorf("face %s at index %d not found", f.ID, i)
-				}
-				pd, e := DumpFace(face, w, f)
-				if e != nil {
-					return nil, fmt.Errorf("dumper[%d]: %w", i, e)
-				}
-				faceDumps = append(faceDumps, pd)
+			if gqlWriter == nil {
+				return []*Writer{}, nil
+			}
+			return []*Writer{gqlWriter}, nil
+		},
+	})
+
+	GqlFaceSourceNodeType = gqlserver.NewNodeType((*FaceSource)(nil))
+	GqlFaceSourceNodeType.GetID = func(source interface{}) string {
+		s := source.(*FaceSource)
+		return s.key.String()
+	}
+	GqlFaceSourceNodeType.Retrieve = func(id string) (interface{}, error) {
+		fd, e := parseFaceDir(id)
+		if e != nil {
+			return nil, e
+		}
+
+		sourcesMutex.Lock()
+		defer sourcesMutex.Unlock()
+		return faceSources[fd], nil
+	}
+	GqlFaceSourceNodeType.Delete = func(source interface{}) error {
+		fs := source.(*FaceSource)
+		return fs.Close()
+	}
+
+	GqlFaceSourceType = graphql.NewObject(GqlFaceSourceNodeType.Annotate(graphql.ObjectConfig{
+		Name:        "PdumpFaceSource",
+		Description: "Packet dump source attached to a face on a single direction.",
+		Fields: graphql.Fields{
+			"writer": &graphql.Field{
+				Description: "Destination writer.",
+				Type:        graphql.NewNonNull(GqlWriterType),
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					s := p.Source.(*FaceSource)
+					return s.Writer, nil
+				},
+			},
+			"face": &graphql.Field{
+				Description: "Source face.",
+				Type:        graphql.NewNonNull(iface.GqlFaceType),
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					s := p.Source.(*FaceSource)
+					return s.Face, nil
+				},
+			},
+			"dir": &graphql.Field{
+				Description: "Traffic direction.",
+				Type:        graphql.NewNonNull(GqlDirectionEnum),
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					s := p.Source.(*FaceSource)
+					return s.Dir, nil
+				},
+			},
+			"names": &graphql.Field{
+				Description: "Name filter.",
+				Type:        gqlserver.NewNonNullList(GqlNameFilterEntryType),
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					s := p.Source.(*FaceSource)
+					return s.Names, nil
+				},
+			},
+		},
+	}))
+	GqlFaceSourceNodeType.Register(GqlFaceSourceType)
+
+	gqlserver.AddMutation(&graphql.Field{
+		Name:        "createPdumpFaceSource",
+		Description: "Create packet dump source attached to a face on a single direction.",
+		Args: graphql.FieldConfigArgument{
+			"writer": &graphql.ArgumentConfig{
+				Description: "Destination writer.",
+				Type:        gqlserver.NonNullID,
+			},
+			"face": &graphql.ArgumentConfig{
+				Description: "Source face.",
+				Type:        gqlserver.NonNullID,
+			},
+			"dir": &graphql.ArgumentConfig{
+				Description: "Traffic direction.",
+				Type:        graphql.NewNonNull(GqlDirectionEnum),
+			},
+			"names": &graphql.ArgumentConfig{
+				Description: "Name filter.",
+				Type:        gqlserver.NewNonNullList(GqlNameFilterEntryInput),
+			},
+		},
+		Type: graphql.NewNonNull(GqlFaceSourceType),
+		Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			cfg := FaceConfig{}
+			gqlserver.RetrieveNodeOfType(GqlWriterNodeType, p.Args["writer"], &cfg.Writer)
+			gqlserver.RetrieveNodeOfType(iface.GqlFaceNodeType, p.Args["face"], &cfg.Face)
+			cfg.Dir = p.Args["dir"].(Direction)
+			jsonhelper.Roundtrip(p.Args["names"], &cfg.Names)
+			return NewFaceSource(cfg)
+		},
+	})
+
+	GqlEthPortSourceNodeType = gqlserver.NewNodeType((*EthPortSource)(nil))
+	GqlEthPortSourceNodeType.GetID = func(source interface{}) string {
+		s := source.(*EthPortSource)
+		return strconv.Itoa(s.Port.EthDev().ID())
+	}
+	GqlEthPortSourceNodeType.Retrieve = func(id string) (interface{}, error) {
+		ethDevObj, _ := ethdev.GqlEthDevNodeType.Retrieve(id)
+		ethDev, _ := ethDevObj.(ethdev.EthDev)
+		port := ethport.Find(ethDev)
+		if port == nil {
+			return nil, nil
+		}
+
+		sourcesMutex.Lock()
+		defer sourcesMutex.Unlock()
+		return ethPortSources[port], nil
+	}
+	GqlEthPortSourceNodeType.Delete = func(source interface{}) error {
+		s := source.(*EthPortSource)
+		return s.Close()
+	}
+
+	GqlEthPortSourceType = graphql.NewObject(GqlEthPortSourceNodeType.Annotate(graphql.ObjectConfig{
+		Name:        "PdumpEthPortSource",
+		Description: "Packet dump source attached to a face on a single direction.",
+		Fields: graphql.Fields{
+			"writer": &graphql.Field{
+				Description: "Destination writer.",
+				Type:        graphql.NewNonNull(GqlWriterType),
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					s := p.Source.(*EthPortSource)
+					return s.Writer, nil
+				},
+			},
+			"port": &graphql.Field{
+				Description: "Ethernet device.",
+				Type:        graphql.NewNonNull(ethdev.GqlEthDevType),
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					s := p.Source.(*EthPortSource)
+					return s.Port.EthDev(), nil
+				},
+			},
+			"grab": &graphql.Field{
+				Description: "Grab opportunity.",
+				Type:        graphql.NewNonNull(GqlEthGrabEnum),
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					s := p.Source.(*EthPortSource)
+					return s.Grab, nil
+				},
+			},
+		},
+	}))
+	GqlEthPortSourceNodeType.Register(GqlEthPortSourceType)
+
+	gqlserver.AddMutation(&graphql.Field{
+		Name:        "createPdumpEthPortSource",
+		Description: "Create packet dump source attached to an Ethernet port on a grab opportunity.",
+		Args: graphql.FieldConfigArgument{
+			"writer": &graphql.ArgumentConfig{
+				Description: "Destination writer.",
+				Type:        gqlserver.NonNullID,
+			},
+			"port": &graphql.ArgumentConfig{
+				Description: "Ethernet device.",
+				Type:        gqlserver.NonNullID,
+			},
+			"grab": &graphql.ArgumentConfig{
+				Description: "Grab opportunity.",
+				Type:        graphql.NewNonNull(GqlEthGrabEnum),
+			},
+		},
+		Type: graphql.NewNonNull(GqlEthPortSourceType),
+		Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			cfg := EthPortConfig{}
+			gqlserver.RetrieveNodeOfType(GqlWriterNodeType, p.Args["writer"], &cfg.Writer)
+			var ethDev ethdev.EthDev
+			if e := gqlserver.RetrieveNodeOfType(ethdev.GqlEthDevNodeType, p.Args["port"], &ethDev); e == nil {
+				cfg.Port = ethport.Find(ethDev)
+			}
+			cfg.Grab = p.Args["grab"].(EthGrab)
+			return NewEthPortSource(cfg)
+		},
+	})
+
+	GqlSourceType = graphql.NewUnion(graphql.UnionConfig{
+		Name:  "PdumpSource",
+		Types: []*graphql.Object{GqlFaceSourceType, GqlEthPortSourceType},
+		ResolveType: func(p graphql.ResolveTypeParams) *graphql.Object {
+			switch p.Value.(type) {
+			case *FaceSource:
+				return GqlFaceSourceType
+			case *EthPortSource:
+				return GqlEthPortSourceType
+			}
+			return nil
+		},
+	})
+
+	GqlWriterType.AddFieldConfig("sources", &graphql.Field{
+		Description: "Packet dump sources.",
+		Type:        gqlserver.NewNonNullList(GqlSourceType),
+		Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			sources := []interface{}{}
+
+			sourcesMutex.Lock()
+			defer sourcesMutex.Unlock()
+			for _, s := range faceSources {
+				sources = append(sources, s)
+			}
+			for _, s := range ethPortSources {
+				sources = append(sources, s)
 			}
 
-			time.Sleep(p.Args["duration"].(nnduration.Nanoseconds).Duration())
-			return true, nil
+			return sources, nil
 		},
 	})
 }

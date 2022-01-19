@@ -22,12 +22,10 @@ import (
 )
 
 func TestFaceRxTx(t *testing.T) {
-	defer ealthread.AllocClear()
 	assert, require := makeAR(t)
 
 	filename, del := testenv.TempName()
 	defer del()
-
 	w, e := pdump.NewWriter(pdump.WriterConfig{
 		Filename:     filename,
 		MaxSize:      1 << 22,
@@ -35,6 +33,7 @@ func TestFaceRxTx(t *testing.T) {
 	})
 	require.NoError(e)
 	require.NoError(ealthread.AllocLaunch(w))
+	defer ealthread.AllocFree(w.LCore())
 
 	face := intface.MustNew()
 	go func() {
@@ -45,18 +44,22 @@ func TestFaceRxTx(t *testing.T) {
 		}
 	}()
 
-	dumpRx, e := pdump.DumpFace(face.D, w, pdump.FaceConfig{
-		Dir: pdump.DirIncoming,
+	dumpRx, e := pdump.NewFaceSource(pdump.FaceConfig{
+		Writer: w,
+		Face:   face.D,
+		Dir:    pdump.DirIncoming,
 		Names: []pdump.NameFilterEntry{
-			{Name: ndn.ParseName("/"), SampleRate: 0.8},
+			{Name: ndn.ParseName("/"), SampleProbability: 0.8},
 		},
 	})
 	require.NoError(e)
-	dumpTx, e := pdump.DumpFace(face.D, w, pdump.FaceConfig{
-		Dir: pdump.DirOutgoing,
+	dumpTx, e := pdump.NewFaceSource(pdump.FaceConfig{
+		Writer: w,
+		Face:   face.D,
+		Dir:    pdump.DirOutgoing,
 		Names: []pdump.NameFilterEntry{
-			{Name: ndn.ParseName("/0"), SampleRate: 0.5},
-			{Name: ndn.ParseName("/3"), SampleRate: 0.2},
+			{Name: ndn.ParseName("/0"), SampleProbability: 0.5},
+			{Name: ndn.ParseName("/3"), SampleProbability: 0.2},
 		},
 	})
 	require.NoError(e)
@@ -75,6 +78,7 @@ func TestFaceRxTx(t *testing.T) {
 	assert.NoError(dumpRx.Close())
 	_ = dumpTx // closing the face should automatically close dumpers
 	face.D.Close()
+	time.Sleep(100 * time.Millisecond)
 	assert.NoError(w.Close())
 
 	f, e := os.Open(filename)
@@ -87,6 +91,7 @@ func TestFaceRxTx(t *testing.T) {
 	nRxData, nTxInterests0, nTxInterests3 := 0, 0, 0
 	var sll layers.LinuxSLL
 	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeLinuxSLL, &sll)
+	parser.IgnoreUnsupported = true
 	decoded := []gopacket.LayerType{}
 	for {
 		pkt, _, e := r.ReadPacketData()

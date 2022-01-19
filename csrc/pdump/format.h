@@ -8,7 +8,11 @@
 #include <pcap/pcap.h>
 #include <pcap/sll.h>
 
-/** @brief DLT_LINUX_SLL direction constants in network byte order. */
+/**
+ * @brief DLT_LINUX_SLL direction constants in network byte order.
+ *
+ * Each value is rte_be16_t type, which has same size as sll_pkttype.
+ */
 enum
 {
   SLLIncoming = RTE_BE16(LINUX_SLL_HOST),
@@ -36,6 +40,12 @@ typedef struct PcapngEPB
   rte_le32_t capLen;
   rte_le32_t origLen;
 } __rte_packed PcapngEPB;
+
+/** @brief PCAPNG block trailer. */
+typedef struct PcapngTrailer
+{
+  rte_le32_t totalLength;
+} __rte_packed PcapngTrailer;
 
 /** @brief PCAPNG enhanced packet block header and tcpdump DLT_LINUX_SLL header. */
 typedef struct PcapngEPBSLL

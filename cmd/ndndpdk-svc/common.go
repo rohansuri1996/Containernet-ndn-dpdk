@@ -10,12 +10,13 @@ import (
 	"github.com/usnistgov/ndn-dpdk/dpdk/ealconfig"
 	"github.com/usnistgov/ndn-dpdk/dpdk/ealinit"
 	"github.com/usnistgov/ndn-dpdk/dpdk/ealthread"
-	"github.com/usnistgov/ndn-dpdk/dpdk/ethdev/ethvdev"
+	"github.com/usnistgov/ndn-dpdk/dpdk/ethdev/ethnetif"
 	"github.com/usnistgov/ndn-dpdk/dpdk/pktmbuf"
 	"github.com/usnistgov/ndn-dpdk/iface"
 	"go.uber.org/zap"
 
 	_ "github.com/usnistgov/ndn-dpdk/iface/ethface"
+	_ "github.com/usnistgov/ndn-dpdk/iface/memifface"
 	_ "github.com/usnistgov/ndn-dpdk/iface/socketface"
 )
 
@@ -67,7 +68,7 @@ func initXDPProgram() {
 		return
 	}
 
-	ethvdev.XDPProgram = path
+	ethnetif.XDPProgram = path
 }
 
 var shutdownOnce sync.Once

@@ -57,16 +57,40 @@ type Pair struct {
 	PortB ethdev.EthDev
 }
 
+// EthDevConfig returns Config that can be used to start a port.
+func (pair *Pair) EthDevConfig() ethdev.Config {
+	return pair.cfg.toEthDevConfig()
+}
+
+// Close stops both ports.
+func (pair *Pair) Close() error {
+	errs := []error{}
+	if pair.PortA != nil {
+		errs = append(errs, pair.PortA.Close())
+	}
+	if pair.PortB != nil {
+		errs = append(errs, pair.PortB.Close())
+	}
+	for _, r := range pair.rings {
+		errs = append(errs, r.Close())
+	}
+	return multierr.Combine(errs...)
+}
+
 // NewPair creates a pair of connected EthDevs.
 func NewPair(cfg PairConfig) (pair *Pair, e error) {
 	cfg.applyDefaults()
 	pair = &Pair{cfg: cfg}
+	defer func() {
+		if e != nil {
+			must.Close(pair)
+		}
+	}()
 
 	for i, count := 0, cfg.NQueues*2; i < count; i++ {
 		ring, e := ringbuffer.New(cfg.RingCapacity, cfg.Socket,
 			ringbuffer.ProducerSingle, ringbuffer.ConsumerSingle)
 		if e != nil {
-			must.Close(pair)
 			return nil, fmt.Errorf("ringbuffer.New %w", e)
 		}
 		pair.rings = append(pair.rings, ring)
@@ -75,34 +99,12 @@ func NewPair(cfg PairConfig) (pair *Pair, e error) {
 
 	pair.PortA, e = New(ringsAB, ringsBA, cfg.Socket)
 	if e != nil {
-		must.Close(pair)
 		return nil, fmt.Errorf("ethringdev.New %w", e)
 	}
 	pair.PortB, e = New(ringsBA, ringsAB, cfg.Socket)
 	if e != nil {
-		must.Close(pair)
 		return nil, fmt.Errorf("ethringdev.New %w", e)
 	}
 
 	return pair, nil
-}
-
-// EthDevConfig returns Config that can be used to start a port.
-func (pair *Pair) EthDevConfig() ethdev.Config {
-	return pair.cfg.toEthDevConfig()
-}
-
-// Close stops both ports.
-func (pair *Pair) Close() error {
-	errs := make([]error, 0, 2+len(pair.rings))
-	if pair.PortA != nil {
-		errs = append(errs, pair.PortA.Stop(ethdev.StopDetach))
-	}
-	if pair.PortB != nil {
-		errs = append(errs, pair.PortB.Stop(ethdev.StopDetach))
-	}
-	for _, r := range pair.rings {
-		errs = append(errs, r.Close())
-	}
-	return multierr.Combine(errs...)
 }

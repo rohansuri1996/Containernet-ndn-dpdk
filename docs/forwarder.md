@@ -37,18 +37,7 @@ NDN-DPDK provides TypeScript definitions to help with authoring the activation p
 Commonly used options have description or links to the corresponding Go documentation.
 You may install the NPM package from `/usr/local/share/ndn-dpdk/ndn-dpdk.npm.tgz` (built from [js](../js) directory), and then construct an object of `ActivateFwArgs` type.
 
-[docs/activate](activate) is a sample TypeScript project that generates the activation parameters.
-To use the sample:
-
-1. Make a copy of this directory to somewhere outside the NDN-DPDK repository.
-2. Run `npm install` to install dependencies.
-3. Open the directory in Visual Studio Code or another editor that recognizes TypeScript definitions.
-   If the NDN-DPDK installation is on a remote machine, you may use the Remote-SSH plugin.
-4. Open `fw-args.ts` in the editor, and make changes.
-   The editor can provide hints on available options.
-5. Run `npm run -s typecheck` to verify your arguments conform to the TypeScript definitions.
-6. Run `npm run -s fw-args | jq` to see the JSON document.
-7. Run `npm run -s fw-args | ndndpdk-ctrl activate-forwarder` to send a forwarder activation command.
+[NDN-DPDK activation sample](../sample/activate) is a sample TypeScript project that generates the activation parameters.
 
 ### Commonly Used Activation Parameters
 
@@ -56,10 +45,6 @@ This section explains some commonly used parameters.
 
 **.eal.cores** is a list of CPU cores allocated to DPDK.
 NDN-DPDK also honors CPU affinity configured in systemd or Docker, see [performance tuning](tuning.md) "CPU isolation".
-
-**.eal.pciDevices** is a list of Ethernet adapters you want to use, written as PCI addresses.
-To find the PCI addresses of available Ethernet adapters, run `dpdk-devbind.py --status-dev net`.
-Ethernet adapters not included in this list can still be activated as virtual devices using `net_af_xdp` or `net_af_packet` driver, at reduced performance; see [hardware known to work](hardware.md) "AF\_XDP and AF\_PACKET sockets" for more information.
 
 **.mempool.DIRECT.dataroom** is the size of each packet buffer.
 The maximum Ethernet port MTU supported by the forwarder is this dataroom minus DPDK mbuf headroom (`RTE_PKTMBUF_HEADROOM`, normally 128) and Ethernet+VLAN header length (18).
@@ -104,10 +89,20 @@ To try this scenario, you need:
 The hosts are labeled *A* and *B*.
 When you read the example commands, make sure to use them on the correct host.
 
-### Create Faces
+The `ndndpdk-ctrl` command line tool is used throughout the scenario.
+You can run any `ndndpdk-ctrl` subcommand with `-h` flag to see available command line flags, such as `ndndpdk-ctrl create-ether-face -h`.
+
+### Create Ethernet Faces
+
+[Face creation](face.md) page describes that there are two steps in creating an Ethernet-based face:
+
+1. Create an Ethernet port on the desired Ethernet adapter.
+2. Create an Ethernet-based face on the Ethernet port.
+
+The `ndndpdk-ctrl create-eth-port` command creates an Ethernet port.
+It returns a JSON object that contains the DPDK device name and local MAC address of the Ethernet adapter.
 
 The `ndndpdk-ctrl create-ether-face` command creates an Ethernet face.
-You can run this command with `-h` option to see available command line arguments.
 It returns a JSON object that contains an `id` property, whose value is an opaque identifier of the face.
 
 NDN-DPDK forwarder does not automatically create new faces when it receives incoming traffic from an unknown source.
@@ -116,43 +111,40 @@ Therefore, when you interconnect two NDN-DPDK forwarders, it's necessary to crea
 Example command and output:
 
 ```shell
+A $ ndndpdk-ctrl create-eth-port --pci 04:00.0 --mtu 9000
+{"id":"1276dc31","macAddr":"02:00:00:00:00:01","name":"0000:04:00.0","numaSocket":1,"rxImpl":"RxTable"}
+# to use '--mtu 9000', .mempool.DIRECT.dataroom in activation parameters should be at least 9146
+
+B $ ndndpdk-ctrl create-eth-port --pci 06:00.0 --mtu 9000
+{"id":"a6a35a10","macAddr":"02:00:00:00:00:02","name":"0000:06:00.0","numaSocket":1,"rxImpl":"RxTable"}
+
 A $ ndndpdk-ctrl create-ether-face --local 02:00:00:00:00:01 --remote 02:00:00:00:00:02
-{"id":"gFmoaws197"}
+{"id":"286d21ff"}
 
 B $ ndndpdk-ctrl create-ether-face --local 02:00:00:00:00:02 --remote 02:00:00:00:00:01
-{"id":"e6vdYnE6G"}
+{"id":"31bfaaa9"}
 ```
 
-If your Ethernet adapter supports jumbo frames, you may set a higher port MTU to take advantage.
-Both hosts must have the same MTU settings.
-
-```bash
-ndndpdk-ctrl create-ether-face --port-mtu 9000 --local 02:00:00:00:00:01 --remote 02:00:00:00:00:02
-# to use '--port-mtu 9000', .mempool.DIRECT.dataroom in activation parameters should be at least 9146
-```
-
-You can programmatically create a face via GraphQL using the `createFace` mutation.
-Its input is a JSON document that conforms to the JSON schema `locator.schema.json` (installed in `/usr/local/share/ndn-dpdk` and [available online](https://ndn-dpdk.ndn.today/schema/locator.schema.json)), which supports more transport types and options than what's available through `ndndpdk-ctrl` commands.
-
+You can programmatically create Ethernet port and face via GraphQL using `createEthPort` and `createFace` mutations.
 As a starting point, you may see the GraphQL operation used by a `ndndpdk-ctrl` command by adding `--cmdout` flag, such as:
 
 ```bash
+ndndpdk-ctrl --cmdout create-eth-port --pci 04:00.0 --mtu 9000
 ndndpdk-ctrl --cmdout create-ether-face --local 02:00:00:00:00:01 --remote 02:00:00:00:00:02
-# --cmdout flag must appear between 'ndndpdk-ctrl' and the subcommand name
+# --cmdout flag must appear between 'ndndpdk-ctrl' and the subcommand name,
 # it is supported on all subcommands
 ```
 
 ### Insert a FIB Entry
 
 The `ndndpdk-ctrl insert-fib` command inserts or overwrites a FIB entry.
-You can run this command with `-h` option to see available command line arguments.
 It returns a JSON object that contains an `id` property, whose value is an opaque identifier of the FIB entry.
 
 Example command and output:
 
 ```shell
-A $ ndndpdk-ctrl insert-fib --name /example/P --nexthop gFmoaws197
-{"id":"JaimdtVXKn"}
+A $ ndndpdk-ctrl insert-fib --name /example/P --nexthop 286d21ff
+{"id":"5aa50b21"}
 ```
 
 You can programmatically insert a FIB entry via GraphQL using the `insertFibEntry` mutation.
@@ -195,7 +187,7 @@ Observing face counter changes while the application is running is an effective 
 Example command and output:
 
 ```shell
-A $ ndndpdk-ctrl get-face --id gFmoaws197 --cnt | jq .counters
+A $ ndndpdk-ctrl get-face --id 286d21ff --cnt | jq .counters
 {
   "rxData": "1024",
   "rxInterests": "0",
